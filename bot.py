@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Flask + Telegram‑бот (polling).  PTB 20.7
+Flask + Telegram‑бот (python‑telegram‑bot 20.x).
 
 ENV‑переменные
-TOKEN   – токен бота          (обязательно)
+TOKEN   – токен бота  (обязательно)
 CHANNEL – @username / id канала (по‑умолчанию @kvartirka61)
-PORT    – порт Flask (Render передаёт автоматически)
+PORT    – порт Flask (Render/Fly передают автоматически)
 """
 
 from __future__ import annotations
@@ -15,19 +15,29 @@ import os
 from typing import Final, List
 
 from flask import Flask, Response
-from httpx import Limits
-from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
-                      InputMediaPhoto, InputMediaVideo, Update)
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import TelegramError
-from telegram.ext import (ApplicationBuilder, CallbackQueryHandler,
-                          CommandHandler, ConversationHandler, ContextTypes,
-                          Defaults, MessageHandler, filters)
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+    ContextTypes,
+    Defaults,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 # ──────────────────── конфигурация ──────────────────────
 TOKEN:   Final[str] = os.getenv("TOKEN", "")
-CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")  # ← канал по‑умолчанию
+CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")
 PORT:    Final[int] = int(os.getenv("PORT", "10000"))
 
 if not TOKEN:
@@ -50,11 +60,13 @@ CONCURRENT_UPDATES: Final[int] = 32
 
 # ───────────────────── helpers ──────────────────────────
 def html(text: str) -> str:
+    """Экранируем минимальный набор HTML‑символов."""
     return (text.replace("&", "&amp;")
                 .replace("<", "&lt;")
                 .replace(">", "&gt;"))
 
 async def _is_subscribed(bot, user_id: int) -> bool:
+    """Проверяем, подписан ли пользователь на канал."""
     try:
         m = await bot.get_chat_member(CHANNEL, user_id)
         return m.status in {
@@ -66,7 +78,9 @@ async def _is_subscribed(bot, user_id: int) -> bool:
     except TelegramError:
         return False
 
-async def require_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+async def require_sub(update: Update,
+                      ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Пускаем дальше только подписанных на канал."""
     if await _is_subscribed(ctx.bot, update.effective_user.id):
         return True
     link = CHANNEL if CHANNEL.startswith("@") else f"https://t.me/{CHANNEL}"
@@ -76,6 +90,7 @@ async def require_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     return False
 
 def build_ad(data: dict) -> str:
+    """Собираем HTML‑текст объявления из user_data."""
     parts = [
         f"<b>{html(data['type'])}</b>",
         f"🏘 <b>Район:</b> {html(data['district'])}",
@@ -113,8 +128,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     ctx.user_data.clear()
     await update.message.reply_text(
-        "Шаг 1/10\nПришлите ВИДЕО объекта или /skip",
-        parse_mode='HTML'
+        "Шаг 1/10\nПришлите ВИДЕО объекта или /skip"
     )
     return VIDEO
 
@@ -145,10 +159,8 @@ async def step_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return PHOTO
 
 async def photo_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Шаг 3/10\nВведите <b>тип объекта</b> (квартира, дом…)",
-        parse_mode='HTML'
-    )
+    await update.message.reply_text("Шаг 3/10\nВведите <b>тип объекта</b>",
+                                    parse_mode='HTML')
     return TYPE
 
 async def step_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -198,7 +210,7 @@ async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb,
         disable_web_page_preview=True
     )
-    await update.message.reply_text(build_ad(ctx.user_data), parse_mode='HTML')
+    await update.message.reply_text(build_ad(ctx.user_data))
     return CONFIRM
 
 async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -229,14 +241,35 @@ async def step_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Диалог отменён.")
     return ConversationHandler.END
 
-# ──────────────── Application / Handlers ───────────────
-request_cfg = HTTPXRequest(
-    connect_timeout=15,
-    read_timeout=15,
-    pool_limits=Limits(max_connections=20, max_keepalive_connections=20),
-    max_retries=1,
-)
+# ──────────────── HTTPXRequest (универсальный) ──────────
+def make_request_cfg() -> HTTPXRequest:
+    """
+    Создаёт HTTPXRequest, совместимый со всеми версиями PTB 20.x
+    (20.0/20.1 используют pool_maxsize, 20.2+ – pool_limits).
+    """
+    from httpx import Limits
+    try:
+        # Новые версии (20.2+) ― имеют pool_limits и max_retries
+        return HTTPXRequest(
+            connect_timeout=15,
+            read_timeout=15,
+            pool_limits=Limits(max_connections=20,
+                               max_keepalive_connections=20),
+            max_retries=1,
+        )
+    except TypeError:
+        # Старые версии (20.0/20.1)
+        return HTTPXRequest(
+            connect_timeout=15,
+            read_timeout=15,
+            pool_timeout=15,
+            pool_maxsize=20,
+            retry_on_connection_error=True,
+        )
 
+request_cfg = make_request_cfg()
+
+# ──────────────── Application / Handlers ───────────────
 application = (
     ApplicationBuilder()
     .token(TOKEN)
@@ -278,6 +311,7 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/", methods=["GET", "HEAD"])
 def index() -> Response:
+    """Health‑check endpoint."""
     return Response("OK", 200)
 
 if __name__ == "__main__":
