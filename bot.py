@@ -1,13 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Telegram‑бот для публикации объявлений в канале @kvartirka61.
-Совместим с Flask 2.x / 3.x и python‑telegram‑bot 20.7.
-Запуск:
-    python bot.py                       # локально
-    gunicorn -w 1 -b 0.0.0.0:$PORT bot:app   # Render / Heroku
-Необходимы переменные окружения:
-    TOKEN   — токен Telegram‑бота (обязательно)
-    CHANNEL — id/username канала для публикаций (по‑умолч.  @kvartirka61)
+Совместим с Flask 2.x/3.x и python‑telegram‑bot 20.7.
 """
 
 from __future__ import annotations
@@ -57,7 +51,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# ─────────────── Состояния ConversationHandler ───────────────────────
+# ──────────── Состояния ConversationHandler ───────────────────────────
 (
     VIDEO,
     PHOTO_OPTIONAL,
@@ -72,7 +66,7 @@ log = logging.getLogger("bot")
     CONFIRM,
 ) = range(11)
 
-# ────────────────────────── ВСПОМОГАТЕЛЬНЫЕ ──────────────────────────
+# ──────────────────────── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────
 def html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -98,7 +92,7 @@ async def require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     )
     return False
 
-# ───────────────────────────── КОМАНДЫ ────────────────────────────────
+# ─────────────────────────── КОМАНДЫ ──────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_subscription(update, ctx):
         return
@@ -116,7 +110,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong")
 
-# ───────────────────── СЦЕНАРИЙ /new (Conversation) ───────────────────
+# ───────────────────────── СЦЕНАРИЙ /new ──────────────────────────────
 async def new_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_subscription(update, ctx):
         return ConversationHandler.END
@@ -245,7 +239,7 @@ async def step_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Диалог прерван.")
     return ConversationHandler.END
 
-# ───────────────────── ОБРАБОТЧИК ОБЩИХ ОШИБОК ───────────────────────
+# ────────────────────── ОБРАБОТКА ОБЩИХ ОШИБОК ────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Exception while handling an update: %s", context.error)
     if isinstance(update, Update) and update.effective_chat:
@@ -253,7 +247,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             update.effective_chat.id, "😔 Ошибка. Попробуйте позже."
         )
 
-# ──────────────────── TELEGRAM APPLICATION ────────────────────────────
+# ───────────────────── TELEGRAM APPLICATION ───────────────────────────
 application = (
     Application.builder()
     .token(TOKEN)
@@ -295,7 +289,7 @@ conv_handler = ConversationHandler(
 
 application.add_handler(conv_handler)
 
-# ─────────────────────── Flask + запуск бота ──────────────────────────
+# ────────────────────────── Flask & Bot ───────────────────────────────
 app = Flask(__name__)
 
 @app.get("/")
@@ -305,7 +299,9 @@ def health() -> Response:
 def run_bot() -> None:
     """
     Запускает polling‑бота в отдельном потоке.
-    Создаём свой event‑loop, чтобы avoid «There is no current event loop».
+    1. Создаём собственный event‑loop
+    2. Отключаем установку сигналов (stop_signals=[])
+       → избегаем 'set_wakeup_fd only works in main thread'.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -320,11 +316,12 @@ def run_bot() -> None:
         ],
         close_loop=False,
         drop_pending_updates=True,
+        stop_signals=[],      # ← ключевая строка
     )
 
-# стартуем поток‑бот сразу
+# стартуем бот сразу при импорте модуля
 threading.Thread(target=run_bot, daemon=True, name="run_bot").start()
 
-# ──────────────────── Локальный запуск (python bot.py) ────────────────
+# ──────────────── Локальный запуск (python bot.py) ────────────────────
 if __name__ == "__main__":
     app.run("0.0.0.0", PORT, use_reloader=False)
