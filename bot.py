@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Flask‑приложение + Telegram‑бот (polling). PTB 20.7
-Бот стартует в post_fork‑хуке Gunicorn (см. gunicorn_conf.py),
-поэтому при импорте run_polling НЕ вызываем.
+Flask + Telegram‑бот (polling).  PTB 20.7
 
 ENV‑переменные
-TOKEN   – токен бота         (обязательно)
-CHANNEL – @username или id    (обязательно)
-PORT    – порт Flask          (Render подставляет $PORT)
+TOKEN   – токен бота          (обязательно)
+CHANNEL – @username / id канала (по‑умолчанию @kvartirka61)
+PORT    – порт Flask (Render передаёт автоматически)
 """
 
 from __future__ import annotations
@@ -17,22 +15,23 @@ import os
 from typing import Final, List
 
 from flask import Flask, Response
+from httpx import Limits
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
                       InputMediaPhoto, InputMediaVideo, Update)
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import TelegramError
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ConversationHandler, ContextTypes, Defaults,
-                          MessageHandler, filters)
+from telegram.ext import (ApplicationBuilder, CallbackQueryHandler,
+                          CommandHandler, ConversationHandler, ContextTypes,
+                          Defaults, MessageHandler, filters)
 from telegram.request import HTTPXRequest
 
 # ──────────────────── конфигурация ──────────────────────
 TOKEN:   Final[str] = os.getenv("TOKEN", "")
-CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")
+CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")  # ← канал по‑умолчанию
 PORT:    Final[int] = int(os.getenv("PORT", "10000"))
 
-if not TOKEN or not CHANNEL:
-    raise RuntimeError("Нужны переменные окружения TOKEN и CHANNEL")
+if not TOKEN:
+    raise RuntimeError("Нужна переменная окружения TOKEN")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,10 +49,10 @@ CONCURRENT_UPDATES: Final[int] = 32
 ) = range(11)
 
 # ───────────────────── helpers ──────────────────────────
-def html(t: str) -> str:                     # экранирование
-    return (t.replace("&", "&amp;")
-              .replace("<", "&lt;")
-              .replace(">", "&gt;"))
+def html(text: str) -> str:
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
 
 async def _is_subscribed(bot, user_id: int) -> bool:
     try:
@@ -77,8 +76,7 @@ async def require_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     return False
 
 def build_ad(data: dict) -> str:
-    """Собираем HTML‑объявление из user_data."""
-    lines = [
+    parts = [
         f"<b>{html(data['type'])}</b>",
         f"🏘 <b>Район:</b> {html(data['district'])}",
         f"🗺 <b>Адрес:</b> {html(data['address'])}",
@@ -89,10 +87,10 @@ def build_ad(data: dict) -> str:
         f"💰 <b>Цена:</b> {html(data['price'])}",
         "\n📞 Писать в ЛС продавцу",
     ]
-    return "\n".join(lines)
+    return "\n".join(parts)
 
 # ───────────────────── команды ──────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await require_sub(update, ctx):
         return
     await update.message.reply_text(
@@ -103,10 +101,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/ping — проверка связи"
     )
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, ctx)
 
-async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
 # ─────────────── Conversation: /new ─────────────────────
@@ -115,27 +113,26 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     ctx.user_data.clear()
     await update.message.reply_text(
-        "Шаг 1/10\n"
-        "Пришлите <b>видео</b> объекта или отправьте /skip",
+        "Шаг 1/10\nПришлите ВИДЕО объекта или /skip",
         parse_mode='HTML'
     )
     return VIDEO
 
 async def step_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["video"] = update.message.video.file_id
-    await update.message.reply_text(
-        "Шаг 2/10\n"
-        f"Пришлите до {MAX_PHOTOS} фото (команда /done когда хватит, /skip — без фото)"
-    )
     ctx.user_data["photos"]: List[str] = []
+    await update.message.reply_text(
+        f"Шаг 2/10\nПришлите до {MAX_PHOTOS} фото "
+        "(/done когда хватит, /skip — без фото)"
+    )
     return PHOTO
 
 async def skip_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["video"] = None
     ctx.user_data["photos"]: List[str] = []
     await update.message.reply_text(
-        "Шаг 2/10\n"
-        f"Пришлите до {MAX_PHOTOS} фото (команда /done когда хватит, /skip — без фото)"
+        f"Шаг 2/10\nПришлите до {MAX_PHOTOS} фото "
+        "(/done когда хватит, /skip — без фото)"
     )
     return PHOTO
 
@@ -148,8 +145,10 @@ async def step_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return PHOTO
 
 async def photo_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Шаг 3/10\nВведите <b>тип объекта</b> (квартира, дом…)",
-                                    parse_mode='HTML')
+    await update.message.reply_text(
+        "Шаг 3/10\nВведите <b>тип объекта</b> (квартира, дом…)",
+        parse_mode='HTML'
+    )
     return TYPE
 
 async def step_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -190,8 +189,6 @@ async def step_area(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["price"] = update.message.text.strip()
 
-    # Формируем предпросмотр
-    msg = build_ad(ctx.user_data)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Опубликовать", callback_data="ok"),
          InlineKeyboardButton("❌ Отмена",      callback_data="cancel")],
@@ -199,10 +196,9 @@ async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Проверьте объявление и нажмите кнопку:",
         reply_markup=kb,
-        disable_web_page_preview=True,
-        parse_mode='HTML'
+        disable_web_page_preview=True
     )
-    await update.message.reply_text(msg, parse_mode='HTML')
+    await update.message.reply_text(build_ad(ctx.user_data), parse_mode='HTML')
     return CONFIRM
 
 async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -216,12 +212,8 @@ async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = build_ad(data)
 
     if data["video"]:
-        await ctx.bot.send_video(
-            CHANNEL,
-            data["video"],
-            caption=text,
-            parse_mode='HTML',
-        )
+        await ctx.bot.send_video(CHANNEL, data["video"],
+                                 caption=text, parse_mode='HTML')
     elif data["photos"]:
         media = [InputMediaPhoto(pid) for pid in data["photos"][:10]]
         media[0].caption = text
@@ -238,52 +230,55 @@ async def step_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ──────────────── Application / Handlers ───────────────
-timeout_req = HTTPXRequest(connect_timeout=15, read_timeout=15,
-                           pool_maxsize=20, retry_on_connection_error=True)
+request_cfg = HTTPXRequest(
+    connect_timeout=15,
+    read_timeout=15,
+    pool_limits=Limits(max_connections=20, max_keepalive_connections=20),
+    max_retries=1,
+)
 
 application = (
-    Application.builder()
+    ApplicationBuilder()
     .token(TOKEN)
     .defaults(Defaults(parse_mode=ParseMode.HTML))
     .concurrent_updates(CONCURRENT_UPDATES)
-    .request(timeout_req)
+    .request(request_cfg)
     .build()
 )
 
 application.add_handler(CommandHandler(["start", "help"], cmd_start))
 application.add_handler(CommandHandler("ping", cmd_ping))
 
-conv_handler = ConversationHandler(
+conv = ConversationHandler(
     entry_points=[CommandHandler("new", cmd_new)],
     states={
-        VIDEO:  [MessageHandler(filters.VIDEO, step_video),
-                 CommandHandler("skip", skip_video)],
-        PHOTO:  [MessageHandler(filters.PHOTO, step_photo),
-                 CommandHandler("done", photo_done),
-                 CommandHandler("skip", photo_done)],
-        TYPE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_type)],
-        DISTRICT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, step_district)],
-        ADDRESS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, step_address)],
-        ROOMS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_rooms)],
-        LAND:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_land)],
-        FLOORS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, step_floors)],
-        AREA:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_area)],
-        PRICE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_price)],
-        CONFIRM:   [CallbackQueryHandler(step_confirm)],
+        VIDEO:    [MessageHandler(filters.VIDEO, step_video),
+                   CommandHandler("skip", skip_video)],
+        PHOTO:    [MessageHandler(filters.PHOTO, step_photo),
+                   CommandHandler("done", photo_done),
+                   CommandHandler("skip", photo_done)],
+        TYPE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_type)],
+        DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_district)],
+        ADDRESS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, step_address)],
+        ROOMS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, step_rooms)],
+        LAND:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_land)],
+        FLOORS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, step_floors)],
+        AREA:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_area)],
+        PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, step_price)],
+        CONFIRM:  [CallbackQueryHandler(step_confirm)],
     },
     fallbacks=[CommandHandler("cancel", step_cancel)],
     name="publish_ad",
     persistent=False,
 )
-application.add_handler(conv_handler)
+application.add_handler(conv)
 
 # ───────────────────── Flask WSGI ───────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/", methods=["GET", "HEAD"])
-def index() -> Response:          # health‑check для Render
+def index() -> Response:
     return Response("OK", 200)
 
-# Возможность локального теста:  python bot.py
 if __name__ == "__main__":
     application.run_polling()
