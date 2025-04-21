@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Flask‑приложение + Telegram‑бот (polling). PTB 20.7.
-Polling **НЕ** запускается при импорте модуля — этим займётся Gunicorn
-через post_fork‑хук (см. gunicorn_conf.py).
+Flask‑приложение + Telegram‑бот (polling). PTB 20.7
+Бот стартует в post_fork‑хуке Gunicorn (см. gunicorn_conf.py),
+поэтому при импорте run_polling НЕ вызываем.
 
-Переменные окружения
---------------------
-TOKEN     – bot‑token                 (обязательно)
-CHANNEL   – @username или id канала    (обязательно)
-PORT      – порт для Flask [$PORT]     (10000 по умолч.)
+ENV‑переменные
+TOKEN   – токен бота         (обязательно)
+CHANNEL – @username или id    (обязательно)
+PORT    – порт Flask          (Render подставляет $PORT)
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import threading
 from typing import Final, List
 
 from flask import Flask, Response
@@ -27,8 +24,9 @@ from telegram.error import TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ConversationHandler, ContextTypes, Defaults,
                           MessageHandler, filters)
+from telegram.request import HTTPXRequest
 
-# ─────────────────── конфигурация ───────────────────────
+# ──────────────────── конфигурация ──────────────────────
 TOKEN:   Final[str] = os.getenv("TOKEN", "")
 CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")
 PORT:    Final[int] = int(os.getenv("PORT", "10000"))
@@ -45,25 +43,27 @@ log = logging.getLogger("bot")
 MAX_PHOTOS: Final[int] = 9
 CONCURRENT_UPDATES: Final[int] = 32
 
-# ─────────── ConversationHandler состояния ───────────────
+# ─────────── ConversationHandler: состояния ─────────────
 (
-    VIDEO, PHOTO_OPTIONAL, TYPE, DISTRICT, ADDRESS,
+    VIDEO, PHOTO, TYPE, DISTRICT, ADDRESS,
     ROOMS, LAND, FLOORS, AREA, PRICE, CONFIRM,
 ) = range(11)
 
-# ───────────────────── helpers ───────────────────────────
-def html(text: str) -> str:
-    return (text.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;"))
+# ───────────────────── helpers ──────────────────────────
+def html(t: str) -> str:                     # экранирование
+    return (t.replace("&", "&amp;")
+              .replace("<", "&lt;")
+              .replace(">", "&gt;"))
 
 async def _is_subscribed(bot, user_id: int) -> bool:
     try:
         m = await bot.get_chat_member(CHANNEL, user_id)
-        return m.status in {ChatMemberStatus.CREATOR,
-                            ChatMemberStatus.ADMINISTRATOR,
-                            ChatMemberStatus.MEMBER,
-                            ChatMemberStatus.RESTRICTED}
+        return m.status in {
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.RESTRICTED,
+        }
     except TelegramError:
         return False
 
@@ -76,16 +76,31 @@ async def require_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     )
     return False
 
-# ─────────────────── команды ─────────────────────────────
+def build_ad(data: dict) -> str:
+    """Собираем HTML‑объявление из user_data."""
+    lines = [
+        f"<b>{html(data['type'])}</b>",
+        f"🏘 <b>Район:</b> {html(data['district'])}",
+        f"🗺 <b>Адрес:</b> {html(data['address'])}",
+        f"🚪 <b>Комнат:</b> {html(data['rooms'])}",
+        f"🌳 <b>Участок:</b> {html(data['land'])}",
+        f"🏢 <b>Этажей:</b> {html(data['floors'])}",
+        f"📐 <b>Площадь:</b> {html(data['area'])}",
+        f"💰 <b>Цена:</b> {html(data['price'])}",
+        "\n📞 Писать в ЛС продавцу",
+    ]
+    return "\n".join(lines)
+
+# ───────────────────── команды ──────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_sub(update, ctx):
         return
     await update.message.reply_text(
         "Привет!\n"
-        "/new ‑ добавить объявление\n"
-        "/cancel ‑ отменить\n"
-        "/help ‑ помощь\n"
-        "/ping ‑ тест"
+        "/new — добавить объявление\n"
+        "/cancel — отменить ввод\n"
+        "/help — помощь\n"
+        "/ping — проверка связи"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,64 +109,181 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong")
 
-# ───────── Conversation /new (шаги опущены для краткости) ──────────
-# --- Содержимое тех же функций, что и раньше ---
-# (step_video, step_photo, photo_done, step_type, …, step_confirm, step_cancel)
-#              Дословно копируем из предыдущей версии
-# --------------------------------------------------------------------
+# ─────────────── Conversation: /new ─────────────────────
+async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await require_sub(update, ctx):
+        return ConversationHandler.END
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        "Шаг 1/10\n"
+        "Пришлите <b>видео</b> объекта или отправьте /skip",
+        parse_mode='HTML'
+    )
+    return VIDEO
 
-# ─────────── Application (PTB 20.7) ────────────────
+async def step_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["video"] = update.message.video.file_id
+    await update.message.reply_text(
+        "Шаг 2/10\n"
+        f"Пришлите до {MAX_PHOTOS} фото (команда /done когда хватит, /skip — без фото)"
+    )
+    ctx.user_data["photos"]: List[str] = []
+    return PHOTO
+
+async def skip_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["video"] = None
+    ctx.user_data["photos"]: List[str] = []
+    await update.message.reply_text(
+        "Шаг 2/10\n"
+        f"Пришлите до {MAX_PHOTOS} фото (команда /done когда хватит, /skip — без фото)"
+    )
+    return PHOTO
+
+async def step_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    photos: List[str] = ctx.user_data["photos"]
+    if len(photos) >= MAX_PHOTOS:
+        await update.message.reply_text(f"Уже {MAX_PHOTOS} фото, используйте /done")
+        return PHOTO
+    photos.append(update.message.photo[-1].file_id)
+    return PHOTO
+
+async def photo_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 3/10\nВведите <b>тип объекта</b> (квартира, дом…)",
+                                    parse_mode='HTML')
+    return TYPE
+
+async def step_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["type"] = update.message.text.strip()
+    await update.message.reply_text("Шаг 4/10\nВведите район:")
+    return DISTRICT
+
+async def step_district(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["district"] = update.message.text.strip()
+    await update.message.reply_text("Шаг 5/10\nВведите адрес:")
+    return ADDRESS
+
+async def step_address(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["address"] = update.message.text.strip()
+    await update.message.reply_text("Шаг 6/10\nСколько комнат?")
+    return ROOMS
+
+async def step_rooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["rooms"] = update.message.text.strip()
+    await update.message.reply_text("Шаг 7/10\nПлощадь участка (м²) или '-' :")
+    return LAND
+
+async def step_land(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["land"] = update.message.text.strip()
+    await update.message.reply_text("Шаг 8/10\nСколько этажей?")
+    return FLOORS
+
+async def step_floors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["floors"] = update.message.text.strip()
+    await update.message.reply_text("Шаг 9/10\nОбщая площадь (м²):")
+    return AREA
+
+async def step_area(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["area"] = update.message.text.strip()
+    await update.message.reply_text("Шаг 10/10\nЦена:")
+    return PRICE
+
+async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["price"] = update.message.text.strip()
+
+    # Формируем предпросмотр
+    msg = build_ad(ctx.user_data)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="ok"),
+         InlineKeyboardButton("❌ Отмена",      callback_data="cancel")],
+    ])
+    await update.message.reply_text(
+        "Проверьте объявление и нажмите кнопку:",
+        reply_markup=kb,
+        disable_web_page_preview=True,
+        parse_mode='HTML'
+    )
+    await update.message.reply_text(msg, parse_mode='HTML')
+    return CONFIRM
+
+async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Отменено.")
+        return ConversationHandler.END
+
+    data = ctx.user_data
+    text = build_ad(data)
+
+    if data["video"]:
+        await ctx.bot.send_video(
+            CHANNEL,
+            data["video"],
+            caption=text,
+            parse_mode='HTML',
+        )
+    elif data["photos"]:
+        media = [InputMediaPhoto(pid) for pid in data["photos"][:10]]
+        media[0].caption = text
+        media[0].parse_mode = 'HTML'
+        await ctx.bot.send_media_group(CHANNEL, media)
+    else:
+        await ctx.bot.send_message(CHANNEL, text, parse_mode='HTML')
+
+    await query.edit_message_text("✅ Опубликовано!")
+    return ConversationHandler.END
+
+async def step_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Диалог отменён.")
+    return ConversationHandler.END
+
+# ──────────────── Application / Handlers ───────────────
+timeout_req = HTTPXRequest(connect_timeout=15, read_timeout=15,
+                           pool_maxsize=20, retry_on_connection_error=True)
+
 application = (
     Application.builder()
     .token(TOKEN)
     .defaults(Defaults(parse_mode=ParseMode.HTML))
     .concurrent_updates(CONCURRENT_UPDATES)
+    .request(timeout_req)
     .build()
 )
 
-# handlers (коротко)
 application.add_handler(CommandHandler(["start", "help"], cmd_start))
 application.add_handler(CommandHandler("ping", cmd_ping))
 
-# ConversationHandler — идентичен прежнему,
-# но БЕЗ per_message=True, чтобы не было warning
-# conv_handler = ConversationHandler( ... )
-# application.add_handler(conv_handler)
-# ----> вставьте его целиком из предыдущей версии без per_message=True
+conv_handler = ConversationHandler(
+    entry_points=[CommandHandler("new", cmd_new)],
+    states={
+        VIDEO:  [MessageHandler(filters.VIDEO, step_video),
+                 CommandHandler("skip", skip_video)],
+        PHOTO:  [MessageHandler(filters.PHOTO, step_photo),
+                 CommandHandler("done", photo_done),
+                 CommandHandler("skip", photo_done)],
+        TYPE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_type)],
+        DISTRICT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, step_district)],
+        ADDRESS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, step_address)],
+        ROOMS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_rooms)],
+        LAND:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_land)],
+        FLOORS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, step_floors)],
+        AREA:      [MessageHandler(filters.TEXT & ~filters.COMMAND, step_area)],
+        PRICE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_price)],
+        CONFIRM:   [CallbackQueryHandler(step_confirm)],
+    },
+    fallbacks=[CommandHandler("cancel", step_cancel)],
+    name="publish_ad",
+    persistent=False,
+)
+application.add_handler(conv_handler)
 
-# ───────── error handler ───────────────────────────
-async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Ошибка при обработке update: %s", ctx.error)
-    if isinstance(update, Update) and update.effective_chat:
-        await ctx.bot.send_message(update.effective_chat.id,
-                                   "😔 Ошибка. Попробуйте позже.")
+# ───────────────────── Flask WSGI ───────────────────────
+flask_app = Flask(__name__)
 
-application.add_error_handler(error_handler)
+@flask_app.route("/", methods=["GET", "HEAD"])
+def index() -> Response:          # health‑check для Render
+    return Response("OK", 200)
 
-# ─────────────────── Flask ‑ healthcheck ───────────
-app = Flask(__name__)
-
-@app.get("/")
-def health() -> Response:
-    return Response("ok", 200)
-
-# ───────────────── polling‑функция ──────────────────
-def run_bot() -> None:
-    """Стартует polling в отдельном потоке. Вызывается из gunicorn_conf."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    log.info("📡 Bot polling started. PID=%s", os.getpid())
-    application.run_polling(
-        allowed_updates=["message", "edited_message",
-                         "callback_query", "my_chat_member"],
-        drop_pending_updates=True,
-        stop_signals=[],      # нельзя ставить signal после forka
-        close_loop=False,
-    )
-
-# ─────────── локальный запуск (`python bot.py`) ─────
+# Возможность локального теста:  python bot.py
 if __name__ == "__main__":
-    # 1. запускаем polling‑поток
-    threading.Thread(target=run_bot, daemon=True).start()
-    # 2. запускаем Flask dev‑сервер
-    app.run("0.0.0.0", PORT, use_reloader=False)
+    application.run_polling()
