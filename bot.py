@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Telegram‑бот для публикации объявлений в канале @kvartirka61
-(PTB 20+, Flask 3).  Автор: «лучший в мире python‑программист» :)
+Telegram‑бот для публикации объявлений в канале @kvartirka61.
+Совместим с Flask 2.x и Flask 3.x, PTB 20.7.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import signal
 import sys
 import threading
 from typing import Final, List
@@ -33,16 +32,16 @@ from telegram.ext import (
     filters,
 )
 
-# ----------------------------- НАСТРОЙКИ -----------------------------
-TOKEN:   Final[str] = os.getenv("TOKEN", "")                 # обязательно
-CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")   # куда публикуем
-PORT:    Final[int] = int(os.getenv("PORT", "10000"))        # Flask‑порт
+# ─────────────────────────── НАСТРОЙКИ ────────────────────────────────
+TOKEN:   Final[str] = os.getenv("TOKEN", "")
+CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")
+PORT:    Final[int] = int(os.getenv("PORT", "10000"))
 
-MAX_PHOTOS: Final[int] = 9           # телеграм пропускает ≤10 элементов в альбоме
-CONCURRENT_UPDATES: Final[int] = 32  # асинхронных апдейтов
+MAX_PHOTOS: Final[int] = 9
+CONCURRENT_UPDATES: Final[int] = 32
 
 if not TOKEN:
-    print("❌  Не задан TOKEN в переменных окружения", file=sys.stderr)
+    print("❌  Переменная TOKEN не задана!", file=sys.stderr)
     sys.exit(1)
 
 logging.basicConfig(
@@ -51,7 +50,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# -------------------- ConversationHandler состояния -------------------
+# ─────────────── Состояния ConversationHandler ────────────────────────
 (
     VIDEO,
     PHOTO_OPTIONAL,
@@ -66,51 +65,38 @@ log = logging.getLogger("bot")
     CONFIRM,
 ) = range(11)
 
-# --------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ------------------------
+# ─────────────────────── ВСПОМОГАТЕЛЬНЫЕ ──────────────────────────────
 def html_escape(text: str) -> str:
-    """Простейший HTML‑escape (PTB ParseMode.HTML)."""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 async def _is_subscribed(bot, user_id: int) -> bool:
-    """
-    True, если пользователь состоит в канале CHANNEL.
-    Боту требуются admin‑права «can_see_members».
-    """
     try:
         member = await bot.get_chat_member(CHANNEL, user_id)
         return member.status in (
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.MEMBER,
-            ChatMemberStatus.RESTRICTED,  # на всякий случай
+            ChatMemberStatus.RESTRICTED,
         )
     except TelegramError as e:
-        log.warning("Не удалось проверить подписку (%s)", e)
+        log.warning("Не удалось проверить подписку: %s", e)
         return False
 
 async def require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Останавливает диалог, если пользователь не подписан."""
     if await _is_subscribed(ctx.bot, update.effective_user.id):
         return True
-
     link = CHANNEL if CHANNEL.startswith("@") else CHANNEL
     await update.effective_chat.send_message(
-        f"🔒 Доступ закрыт.\n"
-        f"Подпишитесь на канал {link} и повторите команду.",
-        disable_web_page_preview=True,
+        f"🔒 Подпишитесь на {link} и повторите команду."
     )
     return False
 
-# ----------------------------- КОМАНДЫ --------------------------------
+# ───────────────────────── КОМАНДЫ ────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_subscription(update, ctx):
         return
     await update.message.reply_text(
-        "Привет! Я помогу разместить объявление в канале.\n"
+        "Привет!\n"
         "• /new — добавить объявление\n"
         "• /cancel — отменить ввод\n"
         "• /help — подсказка\n"
@@ -123,7 +109,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong")
 
-# -------------------- СЦЕНАРИЙ /new (Conversation) --------------------
+# ─────────────────────── СЦЕНАРИЙ /new ────────────────────────────────
 async def new_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_subscription(update, ctx):
         return ConversationHandler.END
@@ -135,32 +121,25 @@ async def step_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not video:
         await update.message.reply_text("Это не видео. Попробуйте ещё раз.")
         return VIDEO
-
     ctx.user_data.clear()
     ctx.user_data["video"] = video.file_id
     ctx.user_data["photos"]: List[str] = []
-
     await update.message.reply_text(
-        "Есть фотографии? Пришлите до 9 штук подряд.\n"
-        "Когда хватит — /done или /skip."
+        "Если есть фото, пришлите до 9 шт. Когда хватит — /done или /skip."
     )
     return PHOTO_OPTIONAL
 
 async def step_photo_collect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if len(ctx.user_data["photos"]) >= MAX_PHOTOS:
-        await update.message.reply_text("Максимум 9 фотографий.")
+        await update.message.reply_text("Лимит 9 фото.")
         return PHOTO_OPTIONAL
     ctx.user_data["photos"].append(update.message.photo[-1].file_id)
     return PHOTO_OPTIONAL
 
 async def photo_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🏢 Квартира", callback_data="Квартира"),
-                InlineKeyboardButton("🏡 Дом", callback_data="Дом"),
-            ]
-        ]
+        [[InlineKeyboardButton("🏢 Квартира", "Квартира"),
+          InlineKeyboardButton("🏡 Дом", "Дом")]]
     )
     await update.message.reply_text("Вид объекта:", reply_markup=kb)
     return TYPE
@@ -188,12 +167,12 @@ async def step_rooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if ctx.user_data["type"] == "Дом":
         await update.message.reply_text("Размер участка (сот.)?")
         return LAND
-    await update.message.reply_text("Этаж / этажность (например 3/5)?")
+    await update.message.reply_text("Этаж / этажность (3/5)?")
     return FLOORS
 
 async def step_land(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["land"] = update.message.text
-    await update.message.reply_text("Этаж / этажность (например 1/2)?")
+    await update.message.reply_text("Этаж / этажность (1/2)?")
     return FLOORS
 
 async def step_floors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -208,82 +187,65 @@ async def step_area(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["price"] = update.message.text
-
     ud = ctx.user_data
-    lines: list[str] = [
+    caption_lines = [
         f"🏠 <b>{html_escape(ud['type'])}</b>",
         f"📍 {html_escape(ud['district'])}",
         f"📌 {html_escape(ud['address'])}",
         f"🛏 {html_escape(ud['rooms'])} комн.",
     ]
     if ud["type"] == "Дом":
-        lines.append(f"🌳 Участок: {html_escape(ud.get('land', '-'))} сот.")
-    lines.extend(
+        caption_lines.append(f"🌳 Участок: {html_escape(ud.get('land', '-'))} сот.")
+    caption_lines.extend(
         [
             f"🏢 Этаж/этажн.: {html_escape(ud['floors'])}",
             f"📐 Площадь: {html_escape(ud['area'])} м²",
             f"💰 <b>{html_escape(ud['price'])} ₽</b>",
         ]
     )
-    ud["caption"] = "\n".join(lines)
-
+    ud["caption"] = "\n".join(caption_lines)
     kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Опубликовать", callback_data="yes"),
-                InlineKeyboardButton("🔄 Заполнить заново", callback_data="redo"),
-            ]
-        ]
+        [[InlineKeyboardButton("✅ Опубликовать", "yes"),
+          InlineKeyboardButton("🔄 Заново", "redo")]]
     )
-    await update.message.reply_video(
-        ud["video"], caption=ud["caption"], reply_markup=kb
-    )
+    await update.message.reply_video(ud["video"], caption=ud["caption"], reply_markup=kb)
     return CONFIRM
 
 async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-
     if q.data == "yes":
-        # окончательная проверка подписки
         if not await _is_subscribed(ctx.bot, q.from_user.id):
             await q.edit_message_caption("🔒 Сначала подпишитесь на канал.")
             return ConversationHandler.END
-
         ud = ctx.user_data
         try:
             if ud["photos"]:
                 media = [InputMediaVideo(ud["video"], caption=ud["caption"])]
                 media += [InputMediaPhoto(pid) for pid in ud["photos"]]
-                await ctx.bot.send_media_group(chat_id=CHANNEL, media=media)
+                await ctx.bot.send_media_group(CHANNEL, media)
             else:
-                await ctx.bot.send_video(
-                    chat_id=CHANNEL, video=ud["video"], caption=ud["caption"]
-                )
+                await ctx.bot.send_video(CHANNEL, ud["video"], caption=ud["caption"])
             await q.edit_message_caption("✅ Опубликовано!")
         except TelegramError as e:
             log.error("Ошибка отправки: %s", e)
             await q.edit_message_caption("❌ Не удалось опубликовать.")
         return ConversationHandler.END
-
-    # «redo»
-    await q.edit_message_text("Заполняем заново. Пришлите видео.")
+    await q.edit_message_text("Начнём заново. Пришлите видео.")
     return VIDEO
 
 async def step_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Диалог прерван.")
     return ConversationHandler.END
 
-# ------------------------ ОБЩИЙ ОБРАБОТЧИК ОШИБОК ---------------------
+# ─────────────────── ОБРАБОТЧИК ОШИБОК ────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Ошибка при обработке апдейта: %s", context.error)
+    log.exception("Exception while handling an update: %s", context.error)
     if isinstance(update, Update) and update.effective_chat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="😔 Что‑то сломалось, попробуйте ещё раз позже.",
-        )
+        await context.bot.send_message(update.effective_chat.id,
+                                       "😔 Ошибка. Попробуйте позже.")
 
-# ------------------ СОЗДАЁМ Telegram‑Application ----------------------
+# ────────────────── СОЗДАНИЕ Telegram‑приложения ──────────────────────
 application = (
     Application.builder()
     .token(TOKEN)
@@ -325,15 +287,14 @@ conv_handler = ConversationHandler(
 
 application.add_handler(conv_handler)
 
-# ---------------------------- Flask‑часть -----------------------------
+# ────────────────── Flask health‑check и запуск бота ──────────────────
 app = Flask(__name__)
 
 @app.get("/")
-def health() -> Response:              # Render health‑check
+def health() -> Response:
     return Response("ok", 200)
 
 def run_bot() -> None:
-    """Запускает PTB‑пуллинг (блокирующий)."""
     log.info("📡  Bot polling started")
     application.run_polling(
         allowed_updates=[
@@ -346,22 +307,9 @@ def run_bot() -> None:
         drop_pending_updates=True,
     )
 
-@app.before_serving
-def activate_bot() -> None:
-    """Стартуем телеграм‑бот в отдельном демоне‑потоке."""
-    threading.Thread(target=run_bot, daemon=True).start()
+# Стартуем бот прямо сейчас, в отдельном daemon‑потоке
+threading.Thread(target=run_bot, daemon=True).start()
 
-# --------------------- Локальный запуск (python bot.py) ---------------
-def _shutdown(*_) -> None:
-    log.info("⏹  Shutting down …")
-    application.stop()
-    sys.exit(0)
-
+# ──────────────── Локальный запуск (python bot.py) ────────────────────
 if __name__ == "__main__":
-    # корректно завершаем по Ctrl+C / SIGTERM
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    # прямо здесь запускаем поток‑бот и Flask‑dev‑server
-    activate_bot()
     app.run("0.0.0.0", PORT, use_reloader=False)
