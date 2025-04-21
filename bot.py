@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 Flask‑приложение + Telegram‑бот (polling) в одном файле.
-Совместимо с python‑telegram‑bot 20.7, Python ≥3.11.
-Расчитано на деплой в Render / Fly / Heroku и пр.
+Совместимо с python‑telegram‑bot 20.7 и Python ≥3.11.
 
-▫ Переменные окружения
-   TOKEN        – Bot‑token от @BotFather  (обязательно)
-   CHANNEL      – @username или numeric id канала, куда публикуем
-   PORT         – порт, который задаёт Render ($PORT)   (по умолч. 10000)
-   BOT_RUNNER   – 1 | 0  : 1 → запускать polling‑бота в этом процессе
-                              0 → не запускать (нужно, если есть
-                                   несколько gunicorn‑воркеров)
+  Переменные окружения
+  --------------------
+  TOKEN        – Bot‑token от @BotFather          (обязательно)
+  CHANNEL      – @username или numeric id канала  (обязательно)
+  PORT         – порт, который задаёт Render ($PORT)   [10000]
+  BOT_RUNNER   – 1 | 0 : 1 → запускать polling‑бота
+                            0 → НЕ запускать (если нужен только Flask)
+
+  Особенности
+  -----------
+  • Flask нужен лишь как health‑endpoint; работает gunicorn‑dev‑сервер.
+  • Один gunicorn‑воркер (-w 1) → один поток polling → нет 409 Conflict.
+  • PTBUserWarning «per_message=False» убран параметром per_message=True.
 """
 
 from __future__ import annotations
@@ -27,8 +32,8 @@ from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ConversationHandler, ContextTypes, MessageHandler,
-                          filters)
+                          ConversationHandler, ContextTypes, Defaults,
+                          MessageHandler, filters)
 
 # ──────────────────── базовая конфигурация ────────────────────────────
 TOKEN:   Final[str] = os.getenv("TOKEN", "")
@@ -39,8 +44,8 @@ BOT_RUNNER: Final[str] = os.getenv("BOT_RUNNER", "1")   # 1 – запускат
 MAX_PHOTOS: Final[int] = 9
 CONCURRENT_UPDATES: Final[int] = 32
 
-if not TOKEN:
-    raise RuntimeError("Переменная окружения TOKEN не задана!")
+if not TOKEN or not CHANNEL:
+    raise RuntimeError("Переменные окружения TOKEN и/или CHANNEL не заданы!")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,13 +68,13 @@ def html(text: str) -> str:
 
 async def _is_subscribed(bot, user_id: int) -> bool:
     try:
-        m = await bot.get_chat_member(CHANNEL, user_id)
-        return m.status in (
+        member = await bot.get_chat_member(CHANNEL, user_id)
+        return member.status in {
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.RESTRICTED,
-        )
+        }
     except TelegramError:
         return False
 
@@ -187,11 +192,11 @@ async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     if ud["type"] == "Дом":
         lines.append(f"🌳 Участок: {html(ud.get('land', '-'))} сот.")
-    lines.extend(
-        [f"🏢 Этаж/этажн.: {html(ud['floors'])}",
-         f"📐 Площадь: {html(ud['area'])} м²",
-         f"💰 <b>{html(ud['price'])} ₽</b>"]
-    )
+    lines.extend([
+        f"🏢 Этаж/этажн.: {html(ud['floors'])}",
+        f"📐 Площадь: {html(ud['area'])} м²",
+        f"💰 <b>{html(ud['price'])} ₽</b>",
+    ])
     ud["caption"] = "\n".join(lines)
 
     kb = InlineKeyboardMarkup(
@@ -239,12 +244,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             update.effective_chat.id, "😔 Ошибка. Попробуйте позже."
         )
 
-# ─────────── Telegram Application (PTB‑20) ────────────────
+# ─────────── Telegram Application (PTB‑20.7) ──────────────
 application = (
     Application.builder()
     .token(TOKEN)
-    .defaults(dict(parse_mode=ParseMode.HTML))
     .concurrent_updates(CONCURRENT_UPDATES)
+    .defaults(Defaults(parse_mode=ParseMode.HTML))
     .build()
 )
 
@@ -281,7 +286,7 @@ conv_handler = ConversationHandler(
     },
     fallbacks=[CommandHandler("cancel", step_cancel)],
     per_user=True,
-    per_message=True,        # чтобы не видеть PTBUserWarning
+    per_message=True,        # ← нет PTBUserWarning
 )
 
 application.add_handler(conv_handler)
@@ -291,7 +296,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def health() -> Response:
-    """Health‑чек для Render."""
+    """Health‑чек для Render (ответ 200 «ok»)."""
     return Response("ok", 200)
 
 # ───────────── запуск polling‑бота в отдельном треде ──────
@@ -302,14 +307,14 @@ def run_bot() -> None:
     application.run_polling(
         allowed_updates=["message", "edited_message",
                          "callback_query", "my_chat_member"],
-        stop_signals=[],        # запрещаем установку signal в дочернем потоке
         drop_pending_updates=True,
+        stop_signals=[],        # нельзя ставить signal в дочернем потоке
         close_loop=False,
     )
 
 if BOT_RUNNER == "1":
     threading.Thread(target=run_bot, daemon=True, name="bot").start()
 
-# ───────────── локальный запуск ───────────────────────────
+# ───────────── локальный запуск (python bot.py) ───────────
 if __name__ == "__main__":
     app.run("0.0.0.0", PORT, use_reloader=False)
