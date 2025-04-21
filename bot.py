@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Telegram‑бот для публикации объявлений в канале @kvartirka61.
-Совместим с Flask 2.x и Flask 3.x, PTB 20.7.
+Совместим с Flask 2.x / 3.x и python‑telegram‑bot 20.7.
+Запуск:
+    python bot.py                       # локально
+    gunicorn -w 1 -b 0.0.0.0:$PORT bot:app   # Render / Heroku
+Необходимы переменные окружения:
+    TOKEN   — токен Telegram‑бота (обязательно)
+    CHANNEL — id/username канала для публикаций (по‑умолч.  @kvartirka61)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -32,7 +39,7 @@ from telegram.ext import (
     filters,
 )
 
-# ─────────────────────────── НАСТРОЙКИ ────────────────────────────────
+# ──────────────────────────── НАСТРОЙКИ ───────────────────────────────
 TOKEN:   Final[str] = os.getenv("TOKEN", "")
 CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")
 PORT:    Final[int] = int(os.getenv("PORT", "10000"))
@@ -50,7 +57,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# ─────────────── Состояния ConversationHandler ────────────────────────
+# ─────────────── Состояния ConversationHandler ───────────────────────
 (
     VIDEO,
     PHOTO_OPTIONAL,
@@ -65,7 +72,7 @@ log = logging.getLogger("bot")
     CONFIRM,
 ) = range(11)
 
-# ─────────────────────── ВСПОМОГАТЕЛЬНЫЕ ──────────────────────────────
+# ────────────────────────── ВСПОМОГАТЕЛЬНЫЕ ──────────────────────────
 def html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -91,7 +98,7 @@ async def require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     )
     return False
 
-# ───────────────────────── КОМАНДЫ ────────────────────────────────────
+# ───────────────────────────── КОМАНДЫ ────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_subscription(update, ctx):
         return
@@ -109,7 +116,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong")
 
-# ─────────────────────── СЦЕНАРИЙ /new ────────────────────────────────
+# ───────────────────── СЦЕНАРИЙ /new (Conversation) ───────────────────
 async def new_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_subscription(update, ctx):
         return ConversationHandler.END
@@ -188,22 +195,22 @@ async def step_area(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["price"] = update.message.text
     ud = ctx.user_data
-    caption_lines = [
+    lines = [
         f"🏠 <b>{html_escape(ud['type'])}</b>",
         f"📍 {html_escape(ud['district'])}",
         f"📌 {html_escape(ud['address'])}",
         f"🛏 {html_escape(ud['rooms'])} комн.",
     ]
     if ud["type"] == "Дом":
-        caption_lines.append(f"🌳 Участок: {html_escape(ud.get('land', '-'))} сот.")
-    caption_lines.extend(
+        lines.append(f"🌳 Участок: {html_escape(ud.get('land', '-'))} сот.")
+    lines.extend(
         [
             f"🏢 Этаж/этажн.: {html_escape(ud['floors'])}",
             f"📐 Площадь: {html_escape(ud['area'])} м²",
             f"💰 <b>{html_escape(ud['price'])} ₽</b>",
         ]
     )
-    ud["caption"] = "\n".join(caption_lines)
+    ud["caption"] = "\n".join(lines)
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("✅ Опубликовать", "yes"),
           InlineKeyboardButton("🔄 Заново", "redo")]]
@@ -238,14 +245,15 @@ async def step_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Диалог прерван.")
     return ConversationHandler.END
 
-# ─────────────────── ОБРАБОТЧИК ОШИБОК ────────────────────────────────
+# ───────────────────── ОБРАБОТЧИК ОБЩИХ ОШИБОК ───────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Exception while handling an update: %s", context.error)
     if isinstance(update, Update) and update.effective_chat:
-        await context.bot.send_message(update.effective_chat.id,
-                                       "😔 Ошибка. Попробуйте позже.")
+        await context.bot.send_message(
+            update.effective_chat.id, "😔 Ошибка. Попробуйте позже."
+        )
 
-# ────────────────── СОЗДАНИЕ Telegram‑приложения ──────────────────────
+# ──────────────────── TELEGRAM APPLICATION ────────────────────────────
 application = (
     Application.builder()
     .token(TOKEN)
@@ -287,7 +295,7 @@ conv_handler = ConversationHandler(
 
 application.add_handler(conv_handler)
 
-# ────────────────── Flask health‑check и запуск бота ──────────────────
+# ─────────────────────── Flask + запуск бота ──────────────────────────
 app = Flask(__name__)
 
 @app.get("/")
@@ -295,7 +303,14 @@ def health() -> Response:
     return Response("ok", 200)
 
 def run_bot() -> None:
-    log.info("📡  Bot polling started")
+    """
+    Запускает polling‑бота в отдельном потоке.
+    Создаём свой event‑loop, чтобы avoid «There is no current event loop».
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    log.info("📡  Bot polling started (thread)")
     application.run_polling(
         allowed_updates=[
             "message",
@@ -307,9 +322,9 @@ def run_bot() -> None:
         drop_pending_updates=True,
     )
 
-# Стартуем бот прямо сейчас, в отдельном daemon‑потоке
-threading.Thread(target=run_bot, daemon=True).start()
+# стартуем поток‑бот сразу
+threading.Thread(target=run_bot, daemon=True, name="run_bot").start()
 
-# ──────────────── Локальный запуск (python bot.py) ────────────────────
+# ──────────────────── Локальный запуск (python bot.py) ────────────────
 if __name__ == "__main__":
     app.run("0.0.0.0", PORT, use_reloader=False)
