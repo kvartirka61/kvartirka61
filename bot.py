@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Telegram‑бот для публикации объявлений в канале @kvartirka61.
-Совместим с Flask 2.x/3.x и python‑telegram‑bot 20.7.
+Flask‑приложение + Telegram‑бот (polling) в одном файле.
+Совместимо с python‑telegram‑bot 20.7, Python ≥3.11.
+Расчитано на деплой в Render / Fly / Heroku и пр.
+
+▫ Переменные окружения
+   TOKEN        – Bot‑token от @BotFather  (обязательно)
+   CHANNEL      – @username или numeric id канала, куда публикуем
+   PORT         – порт, который задаёт Render ($PORT)   (по умолч. 10000)
+   BOT_RUNNER   – 1 | 0  : 1 → запускать polling‑бота в этом процессе
+                              0 → не запускать (нужно, если есть
+                                   несколько gunicorn‑воркеров)
 """
 
 from __future__ import annotations
@@ -9,41 +18,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 import threading
 from typing import Final, List
 
 from flask import Flask, Response
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputMediaPhoto,
-    InputMediaVideo,
-    Update,
-)
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
+                      InputMediaPhoto, InputMediaVideo, Update)
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ConversationHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+                          ConversationHandler, ContextTypes, MessageHandler,
+                          filters)
 
-# ──────────────────────────── НАСТРОЙКИ ───────────────────────────────
+# ──────────────────── базовая конфигурация ────────────────────────────
 TOKEN:   Final[str] = os.getenv("TOKEN", "")
 CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")
 PORT:    Final[int] = int(os.getenv("PORT", "10000"))
+BOT_RUNNER: Final[str] = os.getenv("BOT_RUNNER", "1")   # 1 – запускать бота
 
 MAX_PHOTOS: Final[int] = 9
 CONCURRENT_UPDATES: Final[int] = 32
 
 if not TOKEN:
-    print("❌  Переменная TOKEN не задана!", file=sys.stderr)
-    sys.exit(1)
+    raise RuntimeError("Переменная окружения TOKEN не задана!")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,57 +48,50 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# ──────────── Состояния ConversationHandler ───────────────────────────
+# ─────────── ConversationHandler состояния ────────────────
 (
-    VIDEO,
-    PHOTO_OPTIONAL,
-    TYPE,
-    DISTRICT,
-    ADDRESS,
-    ROOMS,
-    LAND,
-    FLOORS,
-    AREA,
-    PRICE,
-    CONFIRM,
+    VIDEO, PHOTO_OPTIONAL, TYPE, DISTRICT, ADDRESS,
+    ROOMS, LAND, FLOORS, AREA, PRICE, CONFIRM,
 ) = range(11)
 
-# ──────────────────────── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────
-def html_escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+# ───────────────────── вспомогательные ─────────────────────
+def html(text: str) -> str:
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
 
 async def _is_subscribed(bot, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(CHANNEL, user_id)
-        return member.status in (
+        m = await bot.get_chat_member(CHANNEL, user_id)
+        return m.status in (
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.RESTRICTED,
         )
-    except TelegramError as e:
-        log.warning("Не удалось проверить подписку: %s", e)
+    except TelegramError:
         return False
 
-async def require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+async def require_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     if await _is_subscribed(ctx.bot, update.effective_user.id):
         return True
-    link = CHANNEL if CHANNEL.startswith("@") else CHANNEL
+    link = CHANNEL if CHANNEL.startswith("@") else f"https://t.me/{CHANNEL}"
     await update.effective_chat.send_message(
-        f"🔒 Подпишитесь на {link} и повторите команду."
+        f"🔒 Для использования бота подпишитесь на {link}"
     )
     return False
 
-# ─────────────────────────── КОМАНДЫ ──────────────────────────────────
+# ───────────────────────── команды ─────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_subscription(update, ctx):
+    if not await require_sub(update, ctx):
         return
     await update.message.reply_text(
         "Привет!\n"
-        "• /new — добавить объявление\n"
-        "• /cancel — отменить ввод\n"
-        "• /help — подсказка\n"
-        "• /ping — тест"
+        "  /new     – добавить объявление\n"
+        "  /cancel  – отменить диалог\n"
+        "  /help    – помощь\n"
+        "  /ping    – тест"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -110,27 +100,27 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong")
 
-# ───────────────────────── СЦЕНАРИЙ /new ──────────────────────────────
+# ─────────────── conversation /new ─────────────────────────
 async def new_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not await require_subscription(update, ctx):
+    if not await require_sub(update, ctx):
         return ConversationHandler.END
     await update.message.reply_text("Пришлите ВИДЕО объекта")
     return VIDEO
 
 async def step_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    video = update.effective_message.video or update.effective_message.document
-    if not video:
+    v = update.effective_message.video or update.effective_message.document
+    if not v:
         await update.message.reply_text("Это не видео. Попробуйте ещё раз.")
         return VIDEO
     ctx.user_data.clear()
-    ctx.user_data["video"] = video.file_id
+    ctx.user_data["video"] = v.file_id
     ctx.user_data["photos"]: List[str] = []
     await update.message.reply_text(
-        "Если есть фото, пришлите до 9 шт. Когда хватит — /done или /skip."
+        "Если есть фото, пришлите до 9 шт. Когда хватит — /done"
     )
     return PHOTO_OPTIONAL
 
-async def step_photo_collect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def step_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if len(ctx.user_data["photos"]) >= MAX_PHOTOS:
         await update.message.reply_text("Лимит 9 фото.")
         return PHOTO_OPTIONAL
@@ -142,14 +132,14 @@ async def photo_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         [[InlineKeyboardButton("🏢 Квартира", "Квартира"),
           InlineKeyboardButton("🏡 Дом", "Дом")]]
     )
-    await update.message.reply_text("Вид объекта:", reply_markup=kb)
+    await update.message.reply_text("Тип объекта:", reply_markup=kb)
     return TYPE
 
 async def step_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     ctx.user_data["type"] = q.data
-    await q.edit_message_text(f"Вид: {q.data}")
+    await q.edit_message_text(f"Тип: {q.data}")
     await q.message.reply_text("Район?")
     return DISTRICT
 
@@ -160,7 +150,7 @@ async def step_district(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def step_address(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["address"] = update.message.text
-    await update.message.reply_text("Количество комнат?")
+    await update.message.reply_text("Кол-во комнат?")
     return ROOMS
 
 async def step_rooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -190,26 +180,27 @@ async def step_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["price"] = update.message.text
     ud = ctx.user_data
     lines = [
-        f"🏠 <b>{html_escape(ud['type'])}</b>",
-        f"📍 {html_escape(ud['district'])}",
-        f"📌 {html_escape(ud['address'])}",
-        f"🛏 {html_escape(ud['rooms'])} комн.",
+        f"🏠 <b>{html(ud['type'])}</b>",
+        f"📍 {html(ud['district'])}",
+        f"📌 {html(ud['address'])}",
+        f"🛏 {html(ud['rooms'])} комн.",
     ]
     if ud["type"] == "Дом":
-        lines.append(f"🌳 Участок: {html_escape(ud.get('land', '-'))} сот.")
+        lines.append(f"🌳 Участок: {html(ud.get('land', '-'))} сот.")
     lines.extend(
-        [
-            f"🏢 Этаж/этажн.: {html_escape(ud['floors'])}",
-            f"📐 Площадь: {html_escape(ud['area'])} м²",
-            f"💰 <b>{html_escape(ud['price'])} ₽</b>",
-        ]
+        [f"🏢 Этаж/этажн.: {html(ud['floors'])}",
+         f"📐 Площадь: {html(ud['area'])} м²",
+         f"💰 <b>{html(ud['price'])} ₽</b>"]
     )
     ud["caption"] = "\n".join(lines)
+
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("✅ Опубликовать", "yes"),
           InlineKeyboardButton("🔄 Заново", "redo")]]
     )
-    await update.message.reply_video(ud["video"], caption=ud["caption"], reply_markup=kb)
+    await update.message.reply_video(
+        ud["video"], caption=ud["caption"], reply_markup=kb
+    )
     return CONFIRM
 
 async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -226,7 +217,8 @@ async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 media += [InputMediaPhoto(pid) for pid in ud["photos"]]
                 await ctx.bot.send_media_group(CHANNEL, media)
             else:
-                await ctx.bot.send_video(CHANNEL, ud["video"], caption=ud["caption"])
+                await ctx.bot.send_video(CHANNEL, ud["video"],
+                                         caption=ud["caption"])
             await q.edit_message_caption("✅ Опубликовано!")
         except TelegramError as e:
             log.error("Ошибка отправки: %s", e)
@@ -236,18 +228,18 @@ async def step_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return VIDEO
 
 async def step_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Диалог прерван.")
+    await update.message.reply_text("Диалог отменён.")
     return ConversationHandler.END
 
-# ────────────────────── ОБРАБОТКА ОБЩИХ ОШИБОК ────────────────────────
+# ─────────────── error‑handler ─────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Exception while handling an update: %s", context.error)
+    log.exception("Ошибка во время обработки update: %s", context.error)
     if isinstance(update, Update) and update.effective_chat:
         await context.bot.send_message(
             update.effective_chat.id, "😔 Ошибка. Попробуйте позже."
         )
 
-# ───────────────────── TELEGRAM APPLICATION ───────────────────────────
+# ─────────── Telegram Application (PTB‑20) ────────────────
 application = (
     Application.builder()
     .token(TOKEN)
@@ -263,65 +255,61 @@ application.add_handler(CommandHandler("ping", cmd_ping))
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler("new", new_entry)],
     states={
-        VIDEO: [
-            MessageHandler(
-                filters.VIDEO | (filters.Document.VIDEO & ~filters.COMMAND),
-                step_video,
-            )
-        ],
+        VIDEO: [MessageHandler(filters.VIDEO |
+                               (filters.Document.VIDEO & ~filters.COMMAND),
+                               step_video)],
         PHOTO_OPTIONAL: [
-            MessageHandler(filters.PHOTO, step_photo_collect),
+            MessageHandler(filters.PHOTO, step_photo),
             CommandHandler(["done", "skip"], photo_done),
         ],
         TYPE:     [CallbackQueryHandler(step_type)],
-        DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_district)],
-        ADDRESS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, step_address)],
-        ROOMS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, step_rooms)],
-        LAND:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_land)],
-        FLOORS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, step_floors)],
-        AREA:     [MessageHandler(filters.TEXT & ~filters.COMMAND, step_area)],
-        PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, step_price)],
+        DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                  step_district)],
+        ADDRESS:  [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                  step_address)],
+        ROOMS:    [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                  step_rooms)],
+        LAND:     [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                  step_land)],
+        FLOORS:   [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                  step_floors)],
+        AREA:     [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                  step_area)],
+        PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                  step_price)],
         CONFIRM:  [CallbackQueryHandler(step_confirm)],
     },
     fallbacks=[CommandHandler("cancel", step_cancel)],
     per_user=True,
+    per_message=True,        # чтобы не видеть PTBUserWarning
 )
 
 application.add_handler(conv_handler)
 
-# ────────────────────────── Flask & Bot ───────────────────────────────
+# ─────────────────────── Flask ─────────────────────────────
 app = Flask(__name__)
 
 @app.get("/")
 def health() -> Response:
+    """Health‑чек для Render."""
     return Response("ok", 200)
 
+# ───────────── запуск polling‑бота в отдельном треде ──────
 def run_bot() -> None:
-    """
-    Запускает polling‑бота в отдельном потоке.
-    1. Создаём собственный event‑loop
-    2. Отключаем установку сигналов (stop_signals=[])
-       → избегаем 'set_wakeup_fd only works in main thread'.
-    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    log.info("📡  Bot polling started (thread)")
+    log.info("📡 Bot polling started (thread)")
     application.run_polling(
-        allowed_updates=[
-            "message",
-            "edited_message",
-            "callback_query",
-            "my_chat_member",
-        ],
-        close_loop=False,
+        allowed_updates=["message", "edited_message",
+                         "callback_query", "my_chat_member"],
+        stop_signals=[],        # запрещаем установку signal в дочернем потоке
         drop_pending_updates=True,
-        stop_signals=[],      # ← ключевая строка
+        close_loop=False,
     )
 
-# стартуем бот сразу при импорте модуля
-threading.Thread(target=run_bot, daemon=True, name="run_bot").start()
+if BOT_RUNNER == "1":
+    threading.Thread(target=run_bot, daemon=True, name="bot").start()
 
-# ──────────────── Локальный запуск (python bot.py) ────────────────────
+# ───────────── локальный запуск ───────────────────────────
 if __name__ == "__main__":
     app.run("0.0.0.0", PORT, use_reloader=False)
