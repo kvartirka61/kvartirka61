@@ -35,7 +35,7 @@ except ImportError:                         # запасной вариант (�
 ###############################################################################
 
 TOKEN:   Final[str] = os.environ["BOT_TOKEN"]
-CHANNEL: Final[str | int] = int(os.getenv("CHANNEL_ID", "-1001234567890"))
+CHANNEL: Final[str | int] = int(os.getenv("CHANNEL_ID", "@kvartirka61"))
 
 STEP_TITLE, STEP_TEXT, STEP_CONFIRM = range(3)
 
