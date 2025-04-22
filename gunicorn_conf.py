@@ -1,3 +1,10 @@
+import multiprocessing
+import os
 
-# gunicorn_conf.py
-import os, asyncio, logging, multiprocessing
+bind = f"0.0.0.0:{os.getenv('PORT', '8000')}"
+workers = max(2, multiprocessing.cpu_count() * 2 + 1)
+threads = 2
+timeout = 120      # 2 минуты на запрос
+loglevel = "info"
+accesslog = "-"
+errorlog = "-"
