@@ -154,7 +154,9 @@ conv_handler = ConversationHandler(
 
 application.add_handler(conv_handler)
 
-# --- Запуск локально (разработчику) ---
+
+
 if __name__ == "__main__":
-    # Для отладки через polling (НЕ через Flask)
+    # Для локального запуска, не в облаке!
     application.run_polling()
+# В Render запускать gunicorn main:flask_app --bind 0.0.0.0:$PORT
