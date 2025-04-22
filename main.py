@@ -1,162 +1,206 @@
 import os
-import logging
-from typing import Final
+import requests
+from flask import Flask, request
 
-from flask import Flask, request, Response
-from telegram import Update, InputMediaPhoto
-from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ConversationHandler, ContextTypes
-)
+TOKEN = "7616498446:AAHLnra70Zidoq0POp5CCHq610a9JAL1SP8"
+CHANNEL_ID = "@kvartirka61"  # Либо -100... если канал приватный
 
-# --- Переменные окружения ---
-BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "")
-WEBHOOK_SECRET: Final[str] = os.getenv("WEBHOOK_SECRET", "")
-CHANNEL: Final[str] = os.getenv("CHANNEL", "@kvartirka61")
-MAX_PHOTOS: Final[int] = 10
+app = Flask(__name__)
 
-# --- Логирование ---
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
-    level=logging.INFO,
-)
+user_states = {}
+user_data = {}
 
-logger = logging.getLogger(__name__)
+QUESTIONS = [
+    "Укажите район:",
+    "Укажите адрес:",
+    "Количество комнат:",
+    "Площадь (в м²):",
+    "Этаж:",
+    "Этажность дома:",
+    "Вид ремонта (выберите): стровариант, евроремонт, дизайнерский",
+    "Комплектация мебелью и техникой:",
+    "Цена (в рублях):",
+    "Пожалуйста, отправьте видео объекта (или напишите 'нет', если нет видео):",
+    "Пожалуйста, отправьте до 9 фото объекта. После отправки всех фото напишите 'Готово'. Если не хотите загружать фото — напишите 'нет'.",
+]
+FIELDS = [
+    "Район",
+    "Адрес",
+    "Комнат",
+    "Площадь",
+    "Этаж",
+    "Этажность",
+    "Ремонт",
+    "Комплектация",
+    "Цена",
+    "Видео",
+    "Фото"
+]
 
-# --- Flask app ---
-flask_app = Flask(__name__)
+@app.route("/", methods=["GET"])
+def index():
+    return "OK", 200
 
-@flask_app.route("/", methods=["GET", "HEAD"])
-def index() -> Response:
-    return Response("OK", 200)
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if not data or "message" not in data:
+        return "no message", 200
 
-@flask_app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
-def webhook() -> Response:
-    try:
-        data = request.get_json(force=True)
-        update = Update.de_json(data, application.bot)
-        application.create_task(application.process_update(update))
-    except Exception as e:
-        logger.exception("Webhook handling error")
-        return Response("NOK", 400)
-    return Response("OK", 200)
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
 
-# --- Handler states ---
-PHOTO, DESCRIPTION, PRICE, CONFIRM = range(4)
+    # стартовое меню
+    if text == "/start":
+        send_main_menu(chat_id)
+        user_states[chat_id] = None
+        user_data[chat_id] = []
+        return "ok", 200
 
-# --- Telegram Bot Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Отправь мне фото квартиры для объявления (до 10 штук)."
-    )
-    context.user_data.clear()
-    context.user_data["photos"] = []
-    return PHOTO
+    if text == "Загрузить объявление":
+        user_states[chat_id] = 0
+        user_data[chat_id] = []
+        send_message(chat_id, QUESTIONS[0])
+        return "ok", 200
 
-async def add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photos = context.user_data.get("photos", [])
-    if not update.message.photo:
-        await update.message.reply_text("Пожалуйста, пришли фотографию.")
-        return PHOTO
+    # FSM - логика по шагам
+    if chat_id in user_states and user_states[chat_id] is not None:
+        state = user_states[chat_id]
 
-    if len(photos) >= MAX_PHOTOS:
-        await update.message.reply_text(
-            f"Уже {MAX_PHOTOS} фото, используйте /done, чтобы закончить."
-        )
-        return PHOTO
+        # Шаг 9 — Видео
+        if state == 9:
+            if 'video' in message:
+                file_id = message['video']['file_id']
+                user_data[chat_id].append(file_id)
+                user_states[chat_id] = state + 1
+                user_data[chat_id].append([])  # для фото
+                send_message(chat_id, QUESTIONS[state + 1])
+            elif text.lower() == 'нет':
+                user_data[chat_id].append(None)
+                user_states[chat_id] = state + 1
+                user_data[chat_id].append([])  # для фото
+                send_message(chat_id, QUESTIONS[state + 1])
+            else:
+                send_message(chat_id, "Пожалуйста, отправьте видеоролик или напишите 'нет'.")
+            return "ok", 200
 
-    photos.append(update.message.photo[-1].file_id)
-    context.user_data["photos"] = photos
-    await update.message.reply_text(
-        f"Фото добавлено ({len(photos)} из {MAX_PHOTOS}). Еще фото или /done."
-    )
-    return PHOTO
+        # Шаг 10 — Фото (до 9 фото)
+        if state == 10:
+            photos = user_data[chat_id][-1]
+            if text.lower() == "готово":
+                publish_to_channel(user_data[chat_id])
+                send_message(chat_id, "Ваше объявление опубликовано в канале!")
+                user_states[chat_id] = None
+                user_data[chat_id] = []
+                return "ok", 200
+            if text.lower() == "нет" and not photos:
+                user_data[chat_id][-1] = []
+                publish_to_channel(user_data[chat_id])
+                send_message(chat_id, "Ваше объявление опубликовано в канале!")
+                user_states[chat_id] = None
+                user_data[chat_id] = []
+                return "ok", 200
+            if 'photo' in message:
+                file_id = message['photo'][-1]['file_id']
+                if len(photos) < 9:
+                    photos.append(file_id)
+                    user_data[chat_id][-1] = photos
+                    if len(photos) < 9:
+                        send_message(chat_id, f"Добавлено фото {len(photos)}. Можете отправить ещё ({9 - len(photos)}). Когда закончите — напишите 'Готово'.")
+                    else:
+                        publish_to_channel(user_data[chat_id])
+                        send_message(chat_id, "Вы загрузили 9 фото, лимит достигнут! Ваше объявление опубликовано в канале!")
+                        user_states[chat_id] = None
+                        user_data[chat_id] = []
+                else:
+                    send_message(chat_id, "Вы уже загрузили 9 фото.")
+                return "ok", 200
+            if 'media_group_id' in message and 'photo' in message:
+                file_id = message['photo'][-1]['file_id']
+                if len(photos) < 9:
+                    photos.append(file_id)
+                    user_data[chat_id][-1] = photos
+                    if len(photos) >= 9:
+                        publish_to_channel(user_data[chat_id])
+                        send_message(chat_id, "Вы загрузили 9 фото, лимит достигнут! Ваше объявление опубликовано в канале!")
+                        user_states[chat_id] = None
+                        user_data[chat_id] = []
+                return "ok", 200
+            send_message(chat_id, "Пожалуйста, отправьте фото (максимум 9) или напишите 'Готово', когда закончите.")
+            return "ok", 200
 
-async def done_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photos = context.user_data.get("photos", [])
-    if not photos:
-        await update.message.reply_text("Вы не добавили ни одной фотографии.")
-        return PHOTO
-    await update.message.reply_text("Теперь опишите вашу квартиру.")
-    return DESCRIPTION
+        # Вопросы с 0 по 8 — текстовые
+        if state < 9:
+            user_data[chat_id].append(text)
+            user_states[chat_id] = state + 1
+            send_message(chat_id, QUESTIONS[state + 1])
+            return "ok", 200
 
-async def add_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["description"] = update.message.text.strip()
-    await update.message.reply_text("Укажите цену, например: 30000 руб./мес.")
-    return PRICE
+    # По умолчанию выводим меню
+    send_main_menu(chat_id)
+    return "ok", 200
 
-async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["price"] = update.message.text.strip()
-    txt = (
-        f"<b>Новое объявление!</b>\n"
-        f"<b>Цена:</b> {context.user_data['price']}\n\n"
-        f"{context.user_data['description']}\n"
-    )
-    await update.message.reply_text(
-        "Ваше объявление выглядит так (будет опубликовано после /post):"
-    )
-    try:
-        media = [InputMediaPhoto(fid) for fid in context.user_data["photos"][:MAX_PHOTOS]]
-        media[0].caption = txt
-        media[0].parse_mode = 'HTML'
-        # Отправочка предпросмотра (пользователю, не в канал)
-        await update.message.reply_media_group(media)
-    except Exception as e:
-        logger.warning("Не удалось отправить предпросмотр фото: %s", e)
-        await update.message.reply_text(txt, parse_mode='HTML')
-    return CONFIRM
+def send_message(chat_id, text, parse_mode=None):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    requests.post(url, json=payload)
 
-async def confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Публикация в канал
-    txt = (
-        f"<b>Новое объявление!</b>\n"
-        f"<b>Цена:</b> {context.user_data['price']}\n\n"
-        f"{context.user_data['description']}\n"
-        f"\n\nСвязь через: @{update.effective_user.username or update.effective_user.id}"
-    )
-    try:
-        media = [InputMediaPhoto(fid) for fid in context.user_data["photos"][:MAX_PHOTOS]]
-        media[0].caption = txt
-        media[0].parse_mode = 'HTML'
-        await context.bot.send_media_group(CHANNEL, media)
-        await update.message.reply_text("Объявление отправлено!")
-    except Exception as e:
-        logger.exception("Ошибка публикации в канал")
-        await update.message.reply_text("Ошибка публикации. Попробуйте позже.")
+def send_main_menu(chat_id):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    keyboard = {
+        "keyboard": [[{"text": "Загрузить объявление"}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    }
+    payload = {
+        "chat_id": chat_id,
+        "text": "Добро пожаловать! Нажмите кнопку, чтобы загрузить объявление.",
+        "reply_markup": keyboard
+    }
+    requests.post(url, json=payload)
 
-    return ConversationHandler.END
+def send_photo_album_to_channel(photo_file_ids, caption):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMediaGroup"
+    media = [{"type": "photo", "media": photo_file_ids[0], "caption": caption, "parse_mode": "HTML"}]
+    for pid in photo_file_ids[1:]:
+        media.append({"type":"photo", "media": pid})
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "media": media
+    }
+    requests.post(url, json=payload)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Операция отменена. Используйте /start снова.")
-    return ConversationHandler.END
+def send_photo_to_channel(file_id, caption):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    payload = {"chat_id": CHANNEL_ID, "photo": file_id, "caption": caption, "parse_mode": 'HTML'}
+    requests.post(url, json=payload)
 
-# --- Telegram application definition ---
-application = (
-    ApplicationBuilder()
-    .token(BOT_TOKEN)
-    .build()
-)
+def send_video_to_channel(file_id, caption):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendVideo"
+    payload = {"chat_id": CHANNEL_ID, "video": file_id, "caption": caption}
+    requests.post(url, json=payload)
 
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler("start", start)],
-    states={
-        PHOTO: [
-            MessageHandler(filters.PHOTO & (~filters.COMMAND), add_photo),
-            CommandHandler("done", done_photo)
-        ],
-        DESCRIPTION: [MessageHandler(filters.TEXT & (~filters.COMMAND), add_description)],
-        PRICE: [MessageHandler(filters.TEXT & (~filters.COMMAND), add_price)],
-        CONFIRM: [CommandHandler("post", confirm_post)],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    allow_reentry=True,
-)
-
-application.add_handler(conv_handler)
-
-
+def publish_to_channel(data):
+    caption = "<b>Новое объявление:</b>\n"
+    for i in range(0, 9):
+        caption += f"<b>{FIELDS[i]}:</b> {data[i]}\n"
+    photos = data[10]
+    video = data[9]
+    if photos and isinstance(photos, list) and len(photos) > 0:
+        if len(photos) == 1:
+            send_photo_to_channel(photos[0], caption)
+        else:
+            send_photo_album_to_channel(photos[:9], caption)
+    else:
+        send_message(CHANNEL_ID, caption, parse_mode='HTML')
+    if video:
+        send_video_to_channel(video, "Видео объекта")
 
 if __name__ == "__main__":
-    # Для локального запуска, не в облаке!
-    application.run_polling()
-# В Render запускать gunicorn main:flask_app --bind 0.0.0.0:$PORT
+    app.run()
